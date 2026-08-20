@@ -1,0 +1,374 @@
+Good, let’s turn the idea into an actual build path. I’ll check the project-setup guidance first, then I’ll give you a scratch-to-demo roadmap that keeps the first version realistic.
+
+Read skill [project-setup-info-local](file:///home/sriram-23270/.vscode/extensions/github.copilot-chat-0.48.1/assets/prompts/skills/project-setup-info-local/SKILL.md?vscodeLinkType%3Dskill)
+
+Great, this is the right moment to turn the idea into a build roadmap. I’ll quickly check the local project-setup guidance, then I’ll give you a clean from-scratch flow you can follow without getting lost.
+
+Read skill [project-setup-info-local](file:///home/sriram-23270/.vscode/extensions/github.copilot-chat-0.48.1/assets/prompts/skills/project-setup-info-local/SKILL.md?vscodeLinkType%3Dskill)
+
+Super. We’ll build this as a **backend infrastructure project**, not a normal full-stack app.
+
+Project name suggestion: **TrafficPilot**  
+Project type: **API Gateway Policy Manager using Spring Boot**
+
+**End Goal**
+Build a Spring Boot system where an admin/platform engineer can register backend services, create API routes, apply auth/rate-limit/canary policies, and dynamically control API traffic through Spring Cloud Gateway.
+
+Example:
+
+```text
+/payments/** -> payment-service
+JWT required
+100 requests/minute
+90% traffic to payment-v1
+10% traffic to payment-v2
+```
+
+**Overall Flow**
+```text
+Admin / Platform Engineer
+        |
+        v
+Policy Manager APIs
+        |
+        v
+PostgreSQL
+        |
+        v
+Spring Cloud Gateway
+        |
+        v
+user-service / payment-service / order-service
+```
+
+When a client calls:
+
+```http
+GET /payments/history
+```
+
+Gateway will check:
+
+```text
+1. Is route available?
+2. Is JWT/API key valid?
+3. Is user within rate limit?
+4. Should request go to v1 or v2?
+5. Forward request to correct backend service
+```
+
+**What You Should Build From Scratch**
+
+**Phase 1: Basic Setup**
+Create one Spring Boot project first.
+
+Use:
+
+```text
+Java 17 or 21
+Spring Boot
+Spring Cloud Gateway
+Spring Security
+Spring Data JPA
+PostgreSQL
+Redis
+Docker Compose
+Swagger/OpenAPI
+```
+
+For MVP, no frontend needed. Use **Swagger/Postman** to test APIs. That is enough for resume.
+
+**Phase 2: Create Mock Services**
+You need some backend services for gateway to route traffic.
+
+Create simple dummy services:
+
+```text
+user-service
+payment-service-v1
+payment-service-v2
+order-service
+```
+
+Each service can have simple APIs:
+
+```http
+GET /users/profile
+GET /payments/status
+GET /orders/status
+```
+
+They just return text like:
+
+```json
+{
+  "service": "payment-service-v1",
+  "status": "success"
+}
+```
+
+This helps you demo routing and canary traffic.
+
+**Phase 3: Service Registry**
+Build admin APIs to add services.
+
+Example:
+
+```http
+POST /admin/services
+```
+
+Body:
+
+```json
+{
+  "name": "payment-service-v1",
+  "baseUrl": "http://payment-service-v1:8081",
+  "healthCheckPath": "/actuator/health",
+  "ownerTeam": "payments-team"
+}
+```
+
+Store this in PostgreSQL.
+
+Table idea:
+
+```text
+services
+- id
+- name
+- base_url
+- health_check_path
+- owner_team
+- status
+- created_at
+```
+
+**Phase 4: Route Management**
+Build APIs to create routes.
+
+Example:
+
+```http
+POST /admin/routes
+```
+
+Body:
+
+```json
+{
+  "path": "/payments/**",
+  "serviceName": "payment-service-v1",
+  "authRequired": true,
+  "rateLimitPerMinute": 100 
+}
+```
+
+Table idea:
+
+```text
+routes
+- id
+- path
+- service_id
+- auth_required
+- rate_limit_per_minute
+- enabled
+```
+
+Now the gateway should route `/payments/**` to `payment-service-v1`.
+
+**Phase 5: Dynamic Gateway Routing**
+This is the core Spring Boot part.
+
+Instead of hardcoding routes in `application.yml`, store routes in DB and load them dynamically into Spring Cloud Gateway.
+
+Meaning:
+
+```text
+DB route config -> Spring Cloud Gateway route definition -> live routing
+```
+
+This is the heart of the project.
+
+Resume value is high here because it shows dynamic config, not normal CRUD.
+
+**Phase 6: Authentication Policy**
+Add JWT or API-key auth.
+
+Start simple:
+
+```text
+/admin/** needs ADMIN token
+/payments/** needs user JWT if authRequired = true
+/public/** does not need auth
+```
+
+For MVP, API key is easier. JWT is more resume-friendly.
+
+I suggest:
+
+```text
+Admin APIs -> JWT with ADMIN role
+Gateway routes -> JWT/API key based on route policy
+```
+
+**Phase 7: Redis Rate Limiting**
+Use Redis to store request count.
+
+Example rule:
+
+```text
+/payments/** = 100 requests/minute
+```
+
+If a user crosses the limit:
+
+```http
+429 Too Many Requests
+```
+
+This gives you a strong Redis use case.
+
+**Phase 8: Canary Routing**
+Add traffic split between versions.
+
+Example:
+
+```json
+{
+  "path": "/payments/**",
+  "targets": [
+    {
+      "serviceName": "payment-service-v1",
+      "weight": 90
+    },
+    {
+      "serviceName": "payment-service-v2",
+      "weight": 10
+    }
+  ]
+}
+```
+
+When you call `/payments/status` 10 times, around 9 requests should go to v1 and 1 request should go to v2.
+
+This is one of the best interview demo features.
+
+**Phase 9: Config Versioning And Rollback**
+Every route/policy change should create a version.
+
+Example:
+
+```text
+v1 - added payment route
+v2 - added rate limit
+v3 - added canary rule
+```
+
+Rollback API:
+
+```http
+POST /admin/config-versions/2/rollback
+```
+
+After rollback, gateway returns to old behavior.
+
+This connects nicely with your current work around reliable config automation.
+
+**Phase 10: Health Checks And Audit Logs**
+Add scheduled health checks.
+
+Every 30 seconds:
+
+```text
+call payment-service-v1 /actuator/health
+store UP/DOWN
+```
+
+Audit log table:
+
+```text
+audit_logs
+- id
+- actor
+- action
+- old_value
+- new_value
+- created_at
+```
+
+Example:
+
+```text
+admin changed /payments/** rate limit from 100 to 50
+```
+
+**Recommended MVP Order**
+Build in this exact order:
+
+1. Create Spring Boot gateway project.
+2. Add Docker Compose with PostgreSQL and Redis.
+3. Create mock services.
+4. Add service registry APIs.
+5. Add route management APIs.
+6. Load routes dynamically into Spring Cloud Gateway.
+7. Add JWT/API key security.
+8. Add Redis rate limiting.
+9. Add canary routing.
+10. Add versioning, rollback, health check, audit logs.
+
+**Initial Folder Structure**
+For first version, keep one main project:
+
+```text
+trafficpilot/
+  docker-compose.yml
+  gateway-policy-manager/
+    src/main/java/...
+    src/main/resources/application.yml
+  mock-services/
+    user-service/
+    payment-service-v1/
+    payment-service-v2/
+    order-service/
+  README.md
+```
+
+Later, you can split it into microservices. But for now, simple is better.
+
+**Resume Target**
+Final resume line can be:
+
+```latex
+\resumeProjectHeading
+{\textbf{TrafficPilot - API Gateway Policy Manager} \textbar\ \emph{Spring Boot, Spring Cloud Gateway, Redis, PostgreSQL, Docker}}{Backend Infrastructure Project}
+\resumeItemListStart
+\resumeItem{Built a Spring Boot-based API gateway policy manager to configure dynamic routes, service registry entries, authentication rules, and rate-limiting policies.}
+\resumeItem{Implemented Redis-backed rate limiting and canary routing to control API traffic across multiple backend service versions.}
+\resumeItem{Added config versioning, rollback support, health checks, and audit logging to improve reliability of gateway policy changes.}
+\resumeItemListEnd
+```
+
+**First Practical Step**
+Start with the base Spring Boot project:
+
+```text
+Name: trafficpilot
+Package: com.sriram.trafficpilot
+Java: 17 or 21
+Build: Maven
+Dependencies:
+- Spring Cloud Gateway
+- Spring WebFlux
+- Spring Security
+- Spring Data JPA
+- PostgreSQL Driver
+- Validation
+- Actuator
+- Redis
+- Lombok
+- Springdoc OpenAPI
+```
+
+My suggestion: build **backend-only first**. Once routing, rate limiting, canary, and rollback work, then add a small React dashboard only if you have extra time. For your resume, the backend behavior matters more than UI.
