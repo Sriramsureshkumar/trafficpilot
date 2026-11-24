@@ -1,16 +1,18 @@
 package com.sriram.trafficpilot.dto;
 
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
 
 public class CreateServiceRequest {
 
 	@NotBlank
 	private String name;
 	@NotBlank
+	@Pattern(regexp = "^https?://[^\\s/:]+(:\\d{1,5})?(/\\S*)?$", message = "must be a full URL such as http://localhost:9001")
 	private String baseUrl;
 	@NotBlank
+	@Pattern(regexp = "^/(?!/)[^\\s?#]*$", message = "must be an absolute path such as /health")
 	private String healthCheckPath;
-	@NotBlank
 	private String ownerTeam;
 	private String status = "UNKNOWN";
 

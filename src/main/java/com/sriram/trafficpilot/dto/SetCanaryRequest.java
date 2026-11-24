@@ -2,6 +2,7 @@ package com.sriram.trafficpilot.dto;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotEmpty;
+import jakarta.validation.constraints.NotNull;
 
 import java.util.List;
 
@@ -21,8 +22,7 @@ import java.util.List;
 public class SetCanaryRequest {
 
 	@NotEmpty(message = "targets list must not be empty")
-	@Valid
-	private List<CanaryTargetEntry> targets;
+	private List<@Valid @NotNull CanaryTargetEntry> targets;
 
 	public List<CanaryTargetEntry> getTargets() {
 		return targets;

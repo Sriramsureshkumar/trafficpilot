@@ -5,41 +5,32 @@ import com.sriram.trafficpilot.model.RegisteredService;
 import com.sriram.trafficpilot.repository.CanaryTargetRepository;
 import com.sriram.trafficpilot.repository.GatewayRouteRepository;
 import com.sriram.trafficpilot.repository.RegisteredServiceRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
+import org.springframework.cloud.gateway.filter.RouteToRequestUrlFilter;
 import org.springframework.cloud.gateway.route.Route;
 import org.springframework.core.Ordered;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
+import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.util.UriComponentsBuilder;
-import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.net.URI;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
 
 import static org.springframework.cloud.gateway.support.ServerWebExchangeUtils.GATEWAY_REQUEST_URL_ATTR;
 import static org.springframework.cloud.gateway.support.ServerWebExchangeUtils.GATEWAY_ROUTE_ATTR;
 
-/**
- * Phase 8 — Canary Routing Filter.
- *
- * Runs BEFORE the Gateway rewrites the URL (order -2).
- *
- * Algorithm:
- *   1. Get the matched gateway route string-id from the exchange.
- *   2. Look up the numeric gateway_routes.id from the DB.
- *   3. Load all enabled canary_targets for that route.
- *   4. If canary targets exist, pick one using weighted random selection.
- *   5. Look up the chosen service and redirect the request URI to its base_url.
- *   6. If no canary targets exist, pass through untouched (normal routing).
- *
- * The X-Canary-Service response header is added for observability.
- */
 @Component
 public class CanaryRoutingFilter implements GlobalFilter, Ordered {
 
+	private static final Logger log = LoggerFactory.getLogger(CanaryRoutingFilter.class);
 	private final GatewayRouteRepository routeRepository;
 	private final CanaryTargetRepository canaryTargetRepository;
 	private final RegisteredServiceRepository serviceRepository;
@@ -61,102 +52,71 @@ public class CanaryRoutingFilter implements GlobalFilter, Ordered {
 			return chain.filter(exchange);
 		}
 
-		String routeStringId = gatewayRoute.getId();
-
-		return routeRepository.findByRouteId(routeStringId)
-				.flatMap(dbRoute -> canaryTargetRepository
-						.findByRouteIdAndEnabledTrue(dbRoute.getId())
-						.collectList()
-						.flatMap(targets -> {
-							if (targets.isEmpty()) {
-								// No canary configured — normal routing
-								return chain.filter(exchange);
-							}
-							return applyCanary(exchange, chain, targets);
-						}))
-				.switchIfEmpty(Mono.defer(() -> chain.filter(exchange)));
-	}
-
-	/**
-	 * Pick a target using weighted random selection, then mutate the request URI
-	 * so Spring Cloud Gateway forwards to the chosen backend.
-	 */
-	private Mono<Void> applyCanary(
-			ServerWebExchange exchange,
-			GatewayFilterChain chain,
-			List<CanaryTarget> targets
-	) {
-		CanaryTarget chosen = weightedRandom(targets);
-
-		return serviceRepository.findById(chosen.getServiceId())
+		// Resolve a value before invoking the Mono<Void> chain: empty completion is not a missing route.
+		return routeRepository.findByRouteId(gatewayRoute.getId())
+				.flatMap(route -> canaryTargetRepository.findByRouteIdAndEnabledTrue(route.getId())
+						.collectList())
+				.defaultIfEmpty(List.of())
+				.flatMap(targets -> targets.isEmpty() ? Mono.just(Optional.<RegisteredService>empty())
+						: chosenService(targets).map(Optional::of))
 				.flatMap(service -> {
-					ServerWebExchange mutated = rewriteUri(exchange, service);
-					// Expose which backend was chosen for debugging / tracing
-					mutated.getResponse().getHeaders().add("X-Canary-Service", service.getName());
-					return chain.filter(mutated);
+					service.ifPresent(chosen -> rewriteUri(exchange, chosen));
+					return chain.filter(exchange);
 				});
 	}
 
-	/**
-	 * Weighted random selection over a list of canary targets.
-	 *
-	 * Works even when weights don't sum to exactly 100 — uses a random number
-	 * in [0, totalWeight) and walks the list until the running sum passes it.
-	 */
-	static CanaryTarget weightedRandom(List<CanaryTarget> targets) {
-		int totalWeight = targets.stream()
-				.mapToInt(t -> t.getWeight() == null ? 0 : t.getWeight())
-				.sum();
+	private Mono<RegisteredService> chosenService(List<CanaryTarget> targets) {
+		return Mono.fromSupplier(() -> weightedTarget(targets, ThreadLocalRandom.current().nextInt(100)))
+				.flatMap(target -> serviceRepository.findById(target.getServiceId())
+						.switchIfEmpty(Mono.error(new IllegalStateException("Canary service no longer exists"))))
+				.onErrorMap(IllegalStateException.class, ex -> {
+					log.error("Invalid canary configuration", ex);
+					return new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Invalid canary configuration", ex);
+				});
+	}
 
-		if (totalWeight <= 0) {
-			// Fallback: pick first target
-			return targets.get(0);
+	static CanaryTarget weightedTarget(List<CanaryTarget> targets, int draw) {
+		if (targets.isEmpty() || targets.stream().anyMatch(t ->
+				t.getWeight() == null || t.getWeight() < 1 || t.getWeight() > 100)
+				|| targets.stream().mapToLong(CanaryTarget::getWeight).sum() != 100) {
+			throw new IllegalStateException("Enabled canary weights must be positive and sum to 100");
 		}
-
-		int rand = ThreadLocalRandom.current().nextInt(totalWeight);
+		if (draw < 0 || draw >= 100) {
+			throw new IllegalArgumentException("Draw must be in [0, 100)");
+		}
 		int cumulative = 0;
 		for (CanaryTarget target : targets) {
-			cumulative += (target.getWeight() == null ? 0 : target.getWeight());
-			if (rand < cumulative) {
+			cumulative += target.getWeight();
+			if (draw < cumulative) {
 				return target;
 			}
 		}
-		// Should never reach here, but guard against floating-point/rounding
-		return targets.get(targets.size() - 1);
+		throw new IllegalStateException("No canary target selected");
 	}
 
-	/**
-	 * Replace the GATEWAY_REQUEST_URL_ATTR (the URL Spring Cloud Gateway will
-	 * actually forward to) with the chosen service's base_url, preserving the
-	 * original request path and query string.
-	 */
-	private ServerWebExchange rewriteUri(ServerWebExchange exchange, RegisteredService service) {
-		URI originalUri = exchange.getRequest().getURI();
-		URI serviceBase = URI.create(service.getBaseUrl());
-
-		URI newUri = UriComponentsBuilder.fromUri(serviceBase)
-				.path(originalUri.getRawPath())
-				.query(originalUri.getRawQuery())
-				.build(true)
-				.toUri();
-
-		exchange.getAttributes().put(GATEWAY_REQUEST_URL_ATTR, newUri);
-		return exchange;
+	private void rewriteUri(ServerWebExchange exchange, RegisteredService service) {
+		URI routed = exchange.getRequiredAttribute(GATEWAY_REQUEST_URL_ATTR);
+		try {
+			URI base = URI.create(service.getBaseUrl());
+			if (base.getHost() == null || !("http".equalsIgnoreCase(base.getScheme())
+					|| "https".equalsIgnoreCase(base.getScheme()))) {
+				throw new IllegalArgumentException("Canary backend must have an HTTP(S) host");
+			}
+			// Like normal Gateway routing, keep the already stripped/encoded path and query.
+			URI target = UriComponentsBuilder.fromUri(routed)
+					.scheme(base.getScheme()).host(base.getHost()).port(base.getPort())
+					.userInfo(null).fragment(null).build(true).toUri();
+			exchange.getAttributes().put(GATEWAY_REQUEST_URL_ATTR, target);
+			exchange.getResponse().getHeaders().set("X-Canary-Service", service.getName());
+		}
+		catch (IllegalArgumentException ex) {
+			log.error("Invalid canary backend URL for service '{}'", service.getName(), ex);
+			throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Invalid canary backend URL", ex);
+		}
 	}
 
-	/**
-	 * Order -2: runs before GatewayApiKeyFilter (-1) so the URL rewrite
-	 * happens before auth and rate-limit checks inspect it.
-	 *
-	 * Actually for this use case we want auth/rate-limit to still apply, so
-	 * let's run AFTER them but before the actual forwarding.  Spring Cloud
-	 * Gateway's NettyRoutingFilter that does the actual HTTP call is at
-	 * Integer.MIN_VALUE + 1, so order 1 is fine.
-	 *
-	 * Chosen order: 1  (after auth=-1, after rate-limit=0, before forwarding)
-	 */
 	@Override
 	public int getOrder() {
-		return 1;
+		return RouteToRequestUrlFilter.ROUTE_TO_URL_FILTER_ORDER + 1;
 	}
 }

@@ -1,16 +1,22 @@
 package com.sriram.trafficpilot.controller;
 
+import com.sriram.trafficpilot.audit.AuditService;
 import com.sriram.trafficpilot.dto.CreateRouteRequest;
 import com.sriram.trafficpilot.dto.RouteResponse;
 import com.sriram.trafficpilot.model.GatewayRoute;
 import com.sriram.trafficpilot.model.RegisteredService;
+import com.sriram.trafficpilot.repository.CanaryTargetRepository;
 import com.sriram.trafficpilot.repository.GatewayRouteRepository;
 import com.sriram.trafficpilot.repository.RegisteredServiceRepository;
+import com.sriram.trafficpilot.security.AuthPrincipal;
+import com.sriram.trafficpilot.security.ResourceAccess;
 import jakarta.validation.Valid;
 import org.springframework.cloud.gateway.event.RefreshRoutesEvent;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.http.HttpStatus;
+import org.springframework.transaction.reactive.TransactionalOperator;
 import org.springframework.web.server.ResponseStatusException;
+import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -30,52 +36,87 @@ public class AdminRouteController {
 
 	private final GatewayRouteRepository routeRepository;
 	private final RegisteredServiceRepository serviceRepository;
+	private final CanaryTargetRepository canaryTargetRepository;
+	private final ResourceAccess access;
 	private final ApplicationEventPublisher eventPublisher;
+	private final AuditService audit;
+	private final TransactionalOperator transactions;
 
 	public AdminRouteController(
 			GatewayRouteRepository routeRepository,
 			RegisteredServiceRepository serviceRepository,
-			ApplicationEventPublisher eventPublisher
+			CanaryTargetRepository canaryTargetRepository,
+			ResourceAccess access,
+			ApplicationEventPublisher eventPublisher,
+			AuditService audit,
+			TransactionalOperator transactions
 	) {
 		this.routeRepository = routeRepository;
 		this.serviceRepository = serviceRepository;
+		this.canaryTargetRepository = canaryTargetRepository;
+		this.access = access;
 		this.eventPublisher = eventPublisher;
+		this.audit = audit;
+		this.transactions = transactions;
 	}
 
 	@GetMapping
-	public Flux<RouteResponse> listRoutes() {
-		return routeRepository.findAll().flatMap(this::toRouteResponse);
+	public Flux<RouteResponse> listRoutes(ServerWebExchange exchange) {
+		AuthPrincipal principal = AuthPrincipal.of(exchange);
+		return routeRepository.findAll().concatMap(route -> serviceRepository.findById(route.getServiceId())
+				.filter(service -> principal.canAccessTeam(service.getTeamId()))
+				.map(service -> RouteResponse.from(route, service)));
 	}
 
 	@GetMapping("/{id}")
-	public Mono<RouteResponse> getRoute(@PathVariable Long id) {
-		return routeRepository.findById(id)
-				.switchIfEmpty(Mono.error(new ResponseStatusException(HttpStatus.NOT_FOUND, "Route not found")))
-				.flatMap(this::toRouteResponse);
+	public Mono<RouteResponse> getRoute(@PathVariable Long id, ServerWebExchange exchange) {
+		return access.route(id, AuthPrincipal.of(exchange)).flatMap(this::toRouteResponse);
 	}
 
 	@PostMapping
 	@ResponseStatus(HttpStatus.CREATED)
-	public Mono<RouteResponse> createRoute(@Valid @RequestBody CreateRouteRequest request) {
+	public Mono<RouteResponse> createRoute(@Valid @RequestBody CreateRouteRequest request, ServerWebExchange exchange) {
 		String routeId = resolveRouteId(request);
-		return routeRepository.existsByRouteId(routeId)
-				.flatMap(exists -> {
-					if (exists) {
-						return Mono.error(new ResponseStatusException(HttpStatus.CONFLICT, "Route ID already exists"));
-					}
-					return serviceRepository.findByName(request.getServiceName())
-							.switchIfEmpty(Mono.error(new ResponseStatusException(HttpStatus.NOT_FOUND, "Service not found")))
-							.flatMap(service -> routeRepository.save(toRoute(routeId, request, service))
-									.doOnSuccess(savedRoute -> eventPublisher.publishEvent(new RefreshRoutesEvent(this)))
-									.map(savedRoute -> RouteResponse.from(savedRoute, service)));
-				});
+		AuthPrincipal principal = AuthPrincipal.of(exchange);
+		return access.serviceByName(request.getServiceName(), principal)
+				.flatMap(service -> routeRepository.existsByRouteId(routeId)
+						.flatMap(exists -> {
+							if (exists) {
+								return Mono.error(new ResponseStatusException(HttpStatus.CONFLICT, "Route ID already exists"));
+							}
+							return routeRepository.existsByPath(request.getPath());
+						})
+						.flatMap(pathTaken -> {
+							if (pathTaken) {
+								return Mono.error(new ResponseStatusException(HttpStatus.CONFLICT, "Path is already used by another route"));
+							}
+							return routeRepository.save(toRoute(routeId, request, service))
+									.flatMap(saved -> audit.record(principal, service.getTeamId(), saved, "ROUTE_CREATED",
+											routeDetails(saved, service)).thenReturn(saved))
+									.map(savedRoute -> RouteResponse.from(savedRoute, service));
+						}))
+				.as(transactions::transactional)
+				.doOnSuccess(saved -> eventPublisher.publishEvent(new RefreshRoutesEvent(this)));
 	}
 
 	@DeleteMapping("/{id}")
 	@ResponseStatus(HttpStatus.NO_CONTENT)
-	public Mono<Void> deleteRoute(@PathVariable Long id) {
-		return routeRepository.deleteById(id)
+	public Mono<Void> deleteRoute(@PathVariable Long id, ServerWebExchange exchange) {
+		AuthPrincipal principal = AuthPrincipal.of(exchange);
+		return access.route(id, principal)
+				.flatMap(route -> access.service(route.getServiceId(), principal)
+						.flatMap(service -> canaryTargetRepository.deleteByRouteId(route.getId())
+								.then(routeRepository.delete(route))
+								.then(audit.record(principal, service.getTeamId(), route, "ROUTE_DELETED",
+										routeDetails(route, service)))))
+				.as(transactions::transactional)
 				.doOnSuccess(ignored -> eventPublisher.publishEvent(new RefreshRoutesEvent(this)));
+	}
+
+	private String routeDetails(GatewayRoute route, RegisteredService service) {
+		return "path=" + route.getPath() + "; service=" + service.getName()
+				+ "; stripPrefix=" + route.getStripPrefix() + "; authRequired=" + route.getAuthRequired()
+				+ "; rateLimit=" + route.getRateLimitPerMinute() + "; enabled=" + route.getEnabled();
 	}
 
 	private String resolveRouteId(CreateRouteRequest request) {

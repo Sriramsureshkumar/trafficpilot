@@ -19,6 +19,8 @@ import java.util.List;
 @Component
 public class DatabaseRouteDefinitionRepository implements RouteDefinitionRepository {
 
+	private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(DatabaseRouteDefinitionRepository.class);
+
 	private final GatewayRouteRepository routeRepository;
 	private final RegisteredServiceRepository serviceRepository;
 
@@ -34,7 +36,23 @@ public class DatabaseRouteDefinitionRepository implements RouteDefinitionReposit
 	public Flux<RouteDefinition> getRouteDefinitions() {
 		return routeRepository.findByEnabledTrue()
 				.flatMap(route -> serviceRepository.findById(route.getServiceId())
+						.filter(this::hasValidBaseUrl)
 						.map(service -> toRouteDefinition(route, service)));
+	}
+
+	private boolean hasValidBaseUrl(RegisteredService service) {
+		try {
+			URI uri = URI.create(service.getBaseUrl());
+			boolean valid = uri.getHost() != null && uri.getScheme() != null;
+			if (!valid) {
+				log.warn("Skipping routes for service '{}': invalid base URL '{}'", service.getName(), service.getBaseUrl());
+			}
+			return valid;
+		}
+		catch (IllegalArgumentException ex) {
+			log.warn("Skipping routes for service '{}': invalid base URL '{}'", service.getName(), service.getBaseUrl());
+			return false;
+		}
 	}
 
 	@Override

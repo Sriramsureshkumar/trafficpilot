@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<meta name="theme-color" content="#101a2d">
+	<title>TrafficPilot | Gateway Console</title>
+	<link rel="stylesheet" href="/styles.css">
+	<script src="/app.js" defer></script>
+</head>
+<body>
+	<div class="app-shell">
+		<aside class="sidebar">
+			<a class="brand" href="#overview" aria-label="TrafficPilot home">
+				<span class="brand-mark">T</span>
+				<span>traffic<span class="brand-light">pilot</span></span>
+			</a>
+			<div class="workspace-label">WORKSPACE</div>
+			<nav aria-label="Main navigation">
+				<a class="nav-link active" href="#overview"><span class="nav-icon">◫</span>Overview</a>
+				<a class="nav-link" href="#services"><span class="nav-icon">▤</span>Services</a>
+				<a class="nav-link" href="#routes"><span class="nav-icon">⇄</span>Routes</a>
+				<a class="nav-link" href="#canary"><span class="nav-icon">◉</span>Canary routing</a>
+				<a class="nav-link" href="#audit">Audit history</a>
+				<a class="nav-link platform-only" href="#teams"><span class="nav-icon">◎</span>Teams &amp; users</a>
+			</nav>
+			<div class="sidebar-bottom">
+				<div class="environment"><span class="status-dot"></span> Local environment</div>
+				<p>Manage gateway services and traffic policies.</p>
+			</div>
+		</aside>
+
+		<main class="main-content">
+			<header class="topbar">
+				<div class="breadcrumbs">TrafficPilot <span>/</span> <strong>Gateway console</strong></div>
+				<div class="topbar-actions">
+					<span id="connection-status" class="connection-status"><span class="status-dot"></span> Checking connection</span>
+					<span id="user-chip" class="user-chip" hidden></span>
+					<button id="refresh-button" class="button button-quiet" type="button" aria-label="Refresh data">↻ <span>Refresh</span></button>
+					<button id="password-button" class="button button-quiet" type="button" hidden>Password</button>
+					<button id="logout-button" class="button button-quiet" type="button" hidden>Sign out</button>
+				</div>
+			</header>
+
+			<div class="page-content">
+				<section id="overview" class="page-heading">
+					<div>
+						<p class="eyebrow">GATEWAY MANAGEMENT</p>
+						<h1>Overview</h1>
+						<p class="page-description">A clear view of your registered services and gateway traffic.</p>
+					</div>
+					<div class="heading-date"><span class="live-pulse"></span> Live workspace</div>
+				</section>
+
+				<div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+
+				<section class="summary-grid" aria-label="Workspace summary">
+					<article class="summary-card">
+						<div class="summary-icon icon-blue">▤</div>
+						<div class="summary-label">Registered services</div>
+						<div class="summary-value" id="service-count">—</div>
+						<div class="summary-foot">Backend destinations</div>
+					</article>
+					<article class="summary-card">
+						<div class="summary-icon icon-purple">⇄</div>
+						<div class="summary-label">Gateway routes</div>
+						<div class="summary-value" id="route-count">—</div>
+						<div class="summary-foot">Routing rules configured</div>
+					</article>
+					<article class="summary-card">
+						<div class="summary-icon icon-green">◉</div>
+						<div class="summary-label">Canary routes</div>
+						<div class="summary-value" id="canary-count">—</div>
+						<div class="summary-foot">Routes with traffic splits</div>
+					</article>
+					<article class="summary-card health-card">
+						<div class="summary-icon icon-orange">♥</div>
+						<div class="summary-label">Gateway health</div>
+						<div class="summary-value health-value" id="health-value">Checking</div>
+						<div class="summary-foot" id="health-detail">Actuator health endpoint</div>
+					</article>
+				</section>
+
+				<section id="services" class="panel">
+					<div class="section-heading">
+						<div>
+							<p class="eyebrow">BACKENDS</p>
+							<h2>Registered services</h2>
+							<p class="section-description">Backend health is polled every 30 seconds. Status does not automatically disable routing.</p>
+						</div>
+						<button class="button button-primary write-only" id="add-service-button" type="button"><span>＋</span> Add service</button>
+					</div>
+					<div class="table-wrap">
+						<table>
+							<thead><tr><th>Service</th><th>Base URL</th><th>Health path</th><th>Owner</th><th>Status</th><th></th></tr></thead>
+							<tbody id="services-body"><tr><td class="empty-cell" colspan="6">Loading services…</td></tr></tbody>
+						</table>
+					</div>
+				</section>
+
+				<section id="routes" class="panel">
+					<div class="section-heading">
+						<div>
+							<p class="eyebrow">TRAFFIC RULES</p>
+							<h2>Gateway routes</h2>
+							<p class="section-description">Match an incoming path and forward it to a service.</p>
+						</div>
+						<button class="button button-primary write-only" id="add-route-button" type="button"><span>＋</span> Add route</button>
+					</div>
+					<div class="table-wrap">
+						<table>
+							<thead><tr><th>Route</th><th>Incoming path</th><th>Destination</th><th>Policies</th><th>Status</th><th></th></tr></thead>
+							<tbody id="routes-body"><tr><td class="empty-cell" colspan="6">Loading routes…</td></tr></tbody>
+						</table>
+					</div>
+				</section>
+
+				<section id="canary" class="panel canary-panel">
+					<div class="section-heading">
+						<div>
+							<p class="eyebrow">PROGRESSIVE DELIVERY</p>
+							<h2>Canary traffic</h2>
+							<p class="section-description">Gradually send a portion of route traffic to another service.</p>
+						</div>
+					</div>
+					<div class="canary-layout">
+						<div class="canary-intro">
+							<div class="canary-illustration" aria-hidden="true"><span>90%</span><span>10%</span></div>
+							<h3>Roll out with confidence</h3>
+							<p>Split traffic across services by percentage. Weights must add up to 100%.</p>
+						</div>
+						<div class="canary-editor">
+							<label class="field-label" for="canary-route">Choose a route</label>
+							<select id="canary-route"><option value="">Select a route…</option></select>
+							<div id="canary-targets" class="target-list"></div>
+							<div class="canary-controls">
+								<button id="add-target-button" class="button button-quiet write-only" type="button">＋ Add target</button>
+								<span id="weight-total" class="weight-total">Total: —</span>
+							</div>
+							<div class="canary-actions write-only">
+								<button id="remove-canary-button" class="button button-danger-quiet" type="button" disabled>Remove split</button>
+								<button id="save-canary-button" class="button button-primary" type="button" disabled>Save traffic split</button>
+							</div>
+						</div>
+					</div>
+				</section>
+
+				<section id="audit" class="panel">
+					<div class="section-heading">
+						<div>
+							<p class="eyebrow">CHANGE HISTORY</p>
+							<h2>Route audit log</h2>
+							<p class="section-description">Route and canary changes for teams you can access, newest first.</p>
+						</div>
+						<div>
+							<button id="audit-newer" class="button button-quiet" type="button" disabled>Newer</button>
+							<button id="audit-older" class="button button-quiet" type="button" disabled>Older</button>
+						</div>
+					</div>
+					<div class="table-wrap">
+						<table>
+							<thead><tr><th>When</th><th>Who</th><th>Action</th><th>Route</th><th>Details</th></tr></thead>
+							<tbody id="audit-body"><tr><td class="empty-cell" colspan="5">No audit entries loaded.</td></tr></tbody>
+						</table>
+					</div>
+				</section>
+
+				<section id="teams" class="panel platform-only">
+					<div class="section-heading">
+						<div>
+							<p class="eyebrow">ACCESS</p>
+							<h2>Teams</h2>
+							<p class="section-description">Each team only sees and manages its own services and routes.</p>
+						</div>
+						<button class="button button-primary" id="add-team-button" type="button"><span>＋</span> Add team</button>
+					</div>
+					<div class="table-wrap">
+						<table>
+							<thead><tr><th>Team</th><th>Created</th></tr></thead>
+							<tbody id="teams-body"><tr><td class="empty-cell" colspan="2">Loading teams…</td></tr></tbody>
+						</table>
+					</div>
+				</section>
+
+				<section id="users" class="panel platform-only">
+					<div class="section-heading">
+						<div>
+							<p class="eyebrow">ACCESS</p>
+							<h2>Users</h2>
+							<p class="section-description">Platform admins manage everything; team admins edit their team; viewers are read-only.</p>
+						</div>
+						<button class="button button-primary" id="add-user-button" type="button"><span>＋</span> Add user</button>
+					</div>
+					<div class="table-wrap">
+						<table>
+							<thead><tr><th>Username</th><th>Role</th><th>Team</th><th></th></tr></thead>
+							<tbody id="users-body"><tr><td class="empty-cell" colspan="4">Loading users…</td></tr></tbody>
+						</table>
+					</div>
+				</section>
+
+				<footer class="page-footer">
+					<span>TrafficPilot <span id="current-year"></span></span>
+					<span>Gateway policy manager</span>
+				</footer>
+			</div>
+		</main>
+	</div>
+
+	<dialog id="service-dialog" class="form-dialog">
+		<form id="service-form">
+			<div class="dialog-heading"><div><p class="eyebrow">SERVICE REGISTRY</p><h2>Register a service</h2></div><button class="dialog-close" type="button" data-close="service-dialog" aria-label="Close">×</button></div>
+			<label class="field-label" for="service-name">Service name</label>
+			<input id="service-name" name="name" required maxlength="120" placeholder="payments-v1">
+			<label class="field-label" for="service-url">Base URL</label>
+			<input id="service-url" name="baseUrl" type="url" required maxlength="255" placeholder="http://localhost:9001">
+			<div class="form-row">
+				<div><label class="field-label" for="service-health">Health check path</label><input id="service-health" name="healthCheckPath" required maxlength="255" value="/health"></div>
+				<div class="platform-only"><label class="field-label" for="service-owner">Owner team</label><select id="service-owner" name="ownerTeam"></select></div>
+			</div>
+			<div class="dialog-actions"><button class="button button-quiet" type="button" data-close="service-dialog">Cancel</button><button class="button button-primary" type="submit">Register service</button></div>
+		</form>
+	</dialog>
+
+	<dialog id="route-dialog" class="form-dialog">
+		<form id="route-form">
+			<div class="dialog-heading"><div><p class="eyebrow">GATEWAY CONFIGURATION</p><h2>Create a route</h2></div><button class="dialog-close" type="button" data-close="route-dialog" aria-label="Close">×</button></div>
+			<label class="field-label" for="route-id">Route ID <span class="optional">(optional)</span></label>
+			<input id="route-id" name="routeId" maxlength="120" placeholder="Generated from the path if blank">
+			<label class="field-label" for="route-path">Incoming path</label>
+			<input id="route-path" name="path" required maxlength="255" placeholder="/payments/**">
+			<label class="field-label" for="route-service">Backend service</label>
+			<select id="route-service" name="serviceName" required><option value="">Choose a service…</option></select>
+			<div class="form-row">
+				<div><label class="field-label" for="route-strip-prefix">Path segments to strip</label><input id="route-strip-prefix" name="stripPrefix" type="number" min="0" value="0"></div>
+				<div><label class="field-label" for="route-rate-limit">Requests per minute <span class="optional">(optional)</span></label><input id="route-rate-limit" name="rateLimitPerMinute" type="number" min="1" placeholder="No limit"></div>
+			</div>
+			<label class="check-field"><input name="authRequired" type="checkbox"> Require a gateway API key</label>
+			<div class="dialog-actions"><button class="button button-quiet" type="button" data-close="route-dialog">Cancel</button><button class="button button-primary" type="submit">Create route</button></div>
+		</form>
+	</dialog>
+
+	<dialog id="login-dialog" class="form-dialog compact-dialog">
+		<form id="login-form">
+			<div class="dialog-heading"><div><p class="eyebrow">SIGN IN</p><h2>Connect to your gateway</h2></div></div>
+			<p class="dialog-description">Sign in with your TrafficPilot account. Your session stays in this browser tab.</p>
+			<label class="field-label" for="login-username">Username</label>
+			<input id="login-username" autocomplete="username" required maxlength="120">
+			<label class="field-label" for="login-password">Password</label>
+			<input id="login-password" type="password" autocomplete="current-password" required>
+			<div class="dialog-actions"><button class="button button-primary" type="submit">Sign in</button></div>
+		</form>
+	</dialog>
+
+	<dialog id="password-dialog" class="form-dialog compact-dialog">
+		<form id="password-form">
+			<div class="dialog-heading"><div><p class="eyebrow">ACCOUNT</p><h2>Change password</h2></div><button class="dialog-close" type="button" data-close="password-dialog" aria-label="Close">×</button></div>
+			<p class="dialog-description">You will be signed out everywhere after changing it.</p>
+			<label class="field-label" for="current-password">Current password</label>
+			<input id="current-password" name="currentPassword" type="password" autocomplete="current-password" required>
+			<label class="field-label" for="new-password">New password <span class="optional">(at least 10 characters)</span></label>
+			<input id="new-password" name="newPassword" type="password" autocomplete="new-password" required minlength="10" maxlength="72">
+			<div class="dialog-actions"><button class="button button-quiet" type="button" data-close="password-dialog">Cancel</button><button class="button button-primary" type="submit">Change password</button></div>
+		</form>
+	</dialog>
+
+	<dialog id="team-dialog" class="form-dialog compact-dialog">
+		<form id="team-form">
+			<div class="dialog-heading"><div><p class="eyebrow">ACCESS</p><h2>Add a team</h2></div><button class="dialog-close" type="button" data-close="team-dialog" aria-label="Close">×</button></div>
+			<label class="field-label" for="team-name">Team name</label>
+			<input id="team-name" name="name" required maxlength="120" placeholder="payments-team">
+			<div class="dialog-actions"><button class="button button-quiet" type="button" data-close="team-dialog">Cancel</button><button class="button button-primary" type="submit">Add team</button></div>
+		</form>
+	</dialog>
+
+	<dialog id="user-dialog" class="form-dialog">
+		<form id="user-form">
+			<div class="dialog-heading"><div><p class="eyebrow">ACCESS</p><h2>Add a user</h2></div><button class="dialog-close" type="button" data-close="user-dialog" aria-label="Close">×</button></div>
+			<label class="field-label" for="user-username">Username</label>
+			<input id="user-username" name="username" required maxlength="120" pattern="[A-Za-z0-9._@\-]+" autocomplete="off">
+			<label class="field-label" for="user-password">Initial password <span class="optional">(at least 10 characters)</span></label>
+			<input id="user-password" name="password" type="password" required minlength="10" maxlength="72" autocomplete="new-password">
+			<div class="form-row">
+				<div><label class="field-label" for="user-role">Role</label>
+					<select id="user-role" name="role">
+						<option value="TEAM_ADMIN">Team admin</option>
+						<option value="VIEWER">Viewer</option>
+						<option value="PLATFORM_ADMIN">Platform admin</option>
+					</select></div>
+				<div id="user-team-field"><label class="field-label" for="user-team">Team</label><select id="user-team" name="teamName"></select></div>
+			</div>
+			<div class="dialog-actions"><button class="button button-quiet" type="button" data-close="user-dialog">Cancel</button><button class="button button-primary" type="submit">Add user</button></div>
+		</form>
+	</dialog>
+</body>
+</html>

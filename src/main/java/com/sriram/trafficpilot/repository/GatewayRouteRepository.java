@@ -11,5 +11,7 @@ public interface GatewayRouteRepository extends ReactiveCrudRepository<GatewayRo
 
 	Mono<Boolean> existsByRouteId(String routeId);
 
+	Mono<Boolean> existsByPath(String path);
+
 	Mono<GatewayRoute> findByRouteId(String routeId);
 }

@@ -2,18 +2,24 @@ package com.sriram.trafficpilot.ratelimit;
 
 import com.sriram.trafficpilot.model.GatewayRoute;
 import com.sriram.trafficpilot.repository.GatewayRouteRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.cloud.gateway.route.Route;
 import org.springframework.core.Ordered;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.dao.DataAccessException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 import org.springframework.web.server.ServerWebExchange;
+import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
+import java.util.List;
 
 import static org.springframework.cloud.gateway.support.ServerWebExchangeUtils.GATEWAY_ROUTE_ATTR;
 
@@ -22,6 +28,14 @@ public class RedisRateLimitFilter implements GlobalFilter, Ordered {
 
 	private static final String API_KEY_HEADER = "X-Api-Key";
 	private static final String RATE_LIMIT_PREFIX = "trafficpilot:rate:";
+	private static final Logger log = LoggerFactory.getLogger(RedisRateLimitFilter.class);
+	private static final DefaultRedisScript<Long> INCREMENT = new DefaultRedisScript<>("""
+			local count = redis.call('INCR', KEYS[1])
+			if count == 1 or redis.call('PTTL', KEYS[1]) < 0 then
+				redis.call('PEXPIRE', KEYS[1], ARGV[1])
+			end
+			return count
+			""", Long.class);
 
 	private final GatewayRouteRepository routeRepository;
 	private final ReactiveStringRedisTemplate redisTemplate;
@@ -34,6 +48,9 @@ public class RedisRateLimitFilter implements GlobalFilter, Ordered {
 	) {
 		this.routeRepository = routeRepository;
 		this.redisTemplate = redisTemplate;
+		if (windowSeconds <= 0) {
+			throw new IllegalArgumentException("Rate limit window must be positive");
+		}
 		this.rateLimitWindow = Duration.ofSeconds(windowSeconds);
 	}
 
@@ -57,20 +74,13 @@ public class RedisRateLimitFilter implements GlobalFilter, Ordered {
 		}
 
 		String key = rateLimitKey(exchange, route);
-		return redisTemplate.opsForValue().increment(key)
-				.flatMap(count -> expireNewCounter(key, count)
-						.then(Mono.defer(() -> handleCount(exchange, chain, limit, count))))
-				.onErrorResume(ignored -> {
-					exchange.getResponse().setStatusCode(HttpStatus.SERVICE_UNAVAILABLE);
-					return exchange.getResponse().setComplete().thenReturn(true);
-				});
-	}
-
-	private Mono<Boolean> expireNewCounter(String key, Long count) {
-		if (count == 1) {
-			return redisTemplate.expire(key, rateLimitWindow);
-		}
-		return Mono.just(true);
+		return redisTemplate.execute(INCREMENT, List.of(key), List.of(Long.toString(rateLimitWindow.toMillis())))
+				.single()
+				.onErrorMap(DataAccessException.class, ex -> {
+					log.error("Redis rate limit check failed for route '{}'", route.getRouteId(), ex);
+					return new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Rate limiter unavailable", ex);
+				})
+				.flatMap(count -> handleCount(exchange, chain, limit, count));
 	}
 
 	private Mono<Boolean> handleCount(

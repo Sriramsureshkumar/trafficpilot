@@ -16,8 +16,10 @@ TrafficPilot is an **API Gateway Policy Manager**. Think of it as a smart traffi
   - Has this client exceeded its rate limit? (Redis)
   - If ok, forward the request to the real backend service.
 
-Currently the app has **Phase 1 → Phase 7** of the roadmap partially built:
-service registry, route management, dynamic gateway routing, admin API-key auth, gateway API-key auth, and Redis rate limiting.
+The app implements service registration, dynamic routes, team-scoped user login,
+gateway API-key auth, Redis rate limiting, weighted canary routing, scheduled
+backend health checks, and route-change audit history. Config versioning and
+rollback remain unimplemented.
 
 ---
 
@@ -31,7 +33,7 @@ You already know Struts — so let me map the concepts.
 | Action class extending `ActionSupport` | Any plain class annotated with `@RestController` or `@Service` or `@Component` | No inheritance required. |
 | `execute()` method returning a String result (`"success"`, `"error"`) | Regular Java method returning an object (POJO / DTO / `Mono` / `Flux`) | Spring auto-converts the return value to JSON. |
 | Form bean | DTO class (see `CreateRouteRequest`, `CreateServiceRequest`) | Uses `@Valid` + `jakarta.validation` annotations like `@NotBlank`. |
-| Interceptors chain | **Filters** (`WebFilter`, `GlobalFilter`) — see `AdminApiKeyWebFilter`, `GatewayApiKeyFilter`, `RedisRateLimitFilter` | Same idea: intercept requests before they hit the controller. |
+| Interceptors chain | **Filters** (`WebFilter`, `GlobalFilter`) — see `AdminAuthWebFilter`, `GatewayApiKeyFilter`, `RedisRateLimitFilter` | Same idea: intercept requests before they hit the controller. |
 | `struts.properties` | `application.properties` (or `.yml`) | Same idea: key/value config. |
 | Manually wiring services in code | **Dependency Injection** via constructor | Spring creates one instance ("bean") of each `@Component`/`@Service`/`@RestController`/`@Repository` and passes it wherever it's needed. |
 
@@ -70,7 +72,7 @@ Why reactive? Because a gateway must handle **many concurrent connections** with
 
 ```
 trafficpilot/
-├── docker-compose.yml               # Just spins up Redis on port 6379
+├── docker-compose.yml               # PostgreSQL (persistent volume) + Redis
 ├── pom.xml                          # Maven build + Spring Boot dependencies
 ├── Phases-doc                       # Original roadmap (10 phases)
 ├── mock-services/
@@ -89,7 +91,7 @@ trafficpilot/
     └── resources/
         ├── application.properties         # Config (ports, DB URL, keys)
         ├── schema.sql                     # Creates tables at startup
-        └── data.sql                       # Seeds a demo service + route
+        └── data-demo.sql                  # Optional demo services + route
 ```
 
 ---
@@ -101,12 +103,12 @@ trafficpilot/
    - Spring finds every class annotated with `@Component`, `@Service`, `@Repository`, `@RestController`.
    - It instantiates them once each (**singleton beans**) and wires their constructor arguments together.
 3. It reads `application.properties` and creates auto-configured beans:
-   - An **H2 in-memory database** via R2DBC (reactive JDBC).
+   - A **PostgreSQL connection** via R2DBC (non-blocking SQL access, not JDBC).
    - A **ReactiveStringRedisTemplate** connected to `localhost:6379`.
    - A **Spring Cloud Gateway** (built on Netty, reactive).
-4. Because `spring.sql.init.mode=always`, it runs `schema.sql` (creates tables) and `data.sql` (seeds one service + one route).
+4. Because `spring.sql.init.mode=always`, it runs `schema.sql` to create missing tables and indexes. With the optional `demo` profile, `data-demo.sql` inserts two mock services and a route only if their unique names/route ID do not exist; existing configuration is not overwritten.
 5. It starts a Netty server (default port **8080**).
-6. Spring Cloud Gateway asks all `RouteDefinitionRepository` beans for their routes. Our `DatabaseRouteDefinitionRepository` reads from the DB and returns the seeded route.
+6. Spring Cloud Gateway asks all `RouteDefinitionRepository` beans for their routes. Our `DatabaseRouteDefinitionRepository` reads the saved routes from PostgreSQL.
 7. Server is live. Requests to `/admin/**` hit the controllers; requests to `/payments/**` are proxied to the backend.
 
 ---
@@ -142,7 +144,7 @@ Mapped by `model/RegisteredService.java` (`@Table("registered_services")`, `@Id`
 
 Mapped by `model/GatewayRoute.java`.
 
-The seed row in `data.sql`:
+The optional seed row in `data-demo.sql`:
 - Service: `payment-service-v1` at `http://localhost:9001`.
 - Route: `/payments/**` → that service, strip 1 prefix, auth required, 100 req/min.
 
@@ -243,12 +245,15 @@ For each enabled `GatewayRoute` row, it looks up the target service, then builds
 
 ---
 
-## 10. Security — Two Layers of API Keys
+## 10. Security — User Login plus a Gateway API Key
 
-### Layer A — Admin API key (`AdminApiKeyWebFilter`)
-- Runs as a **`WebFilter`** (WebFlux level, catches *every* HTTP request into the app).
-- If the URL starts with `/admin/`, it demands header `X-Admin-Key: admin-secret`.
-- Missing/wrong key → `401 Unauthorized`.
+### Layer A — User login and roles (`AdminAuthWebFilter`)
+- Runs as a **`WebFilter`** (WebFlux level). `POST /auth/login` (public) returns an opaque bearer token; the SHA-256 hash is stored in `auth_tokens` (8h TTL).
+- Everything under `/admin/` needs `Authorization: Bearer <token>`; missing/invalid/expired → `401`.
+- Roles: `PLATFORM_ADMIN` (everything, plus `/admin/teams` and `/admin/users`), `TEAM_ADMIN` (read/write own team's services, routes, canaries), `VIEWER` (read-only on own team; writes → `403`).
+- Services belong to a team (`team_id`); routes and canaries inherit it through their service. Resources of other teams return `404`, not `403`, so their existence isn't leaked.
+- Passwords are BCrypt-hashed (`spring-security-crypto` only). 5 failed logins lock a username for 15 minutes (Redis key `login-fail:<username>`). Changing a password revokes existing sessions.
+- On first start `SecurityBootstrap` creates the bootstrap admin (`TRAFFICPILOT_ADMIN_USERNAME`, default `admin`; `TRAFFICPILOT_ADMIN_PASSWORD`, required, min 10 chars) and backfills teams from legacy `owner_team` labels.
 - Other paths (`/payments/**`, `/health-check`, etc.) pass through untouched.
 
 ### Layer B — Gateway API key (`GatewayApiKeyFilter`)
@@ -261,12 +266,10 @@ For each enabled `GatewayRoute` row, it looks up the target service, then builds
 ### The keys themselves
 Live in `application.properties`:
 ```
-trafficpilot.security.admin-api-key=admin-secret
 trafficpilot.security.gateway-api-key=user-secret
+trafficpilot.security.token-ttl-hours=8
 ```
-Read into `ApiKeyProperties` via `@Value` — a simple config-holder bean that the filters inject.
-
-*(Later phases can swap API keys for JWT.)*
+The gateway key is read into `ApiKeyProperties` via `@Value`. It is still one shared, global key (per-team gateway keys are a future phase).
 
 ---
 
@@ -279,12 +282,16 @@ For every proxied request:
 2. If it has no `rateLimitPerMinute`, skip.
 3. Build a Redis key: `trafficpilot:rate:<routeId>:<clientId>`
    - `clientId` = `X-Api-Key` header, or client IP as fallback.
-4. `INCR` that key in Redis (atomic counter).
-5. If this is the first hit (`count == 1`), set a TTL of 60s (from `trafficpilot.rate-limit.window-seconds`).
+4. Execute one Redis Lua script: `INCR` the counter and, on the first hit, set its TTL (60s by default, from `trafficpilot.rate-limit.window-seconds`). Increment and expiry are atomic; the script also repairs old counters missing a TTL.
+5. Requests share a window per route/client, not per backend (including canary backends).
 6. If `count > limit` → respond `429 Too Many Requests` with a `Retry-After` header.
 7. Otherwise add `X-RateLimit-Limit` / `X-RateLimit-Remaining` headers and continue.
 
 This is a classic **fixed-window** rate limiter (simple and works well enough for MVP).
+The configured window must be positive. `Retry-After` is a conservative full-window
+delay, not the exact remaining TTL. Redis failures are logged and fail closed
+with `503`; downstream errors propagate unchanged instead of being mistaken
+for Redis outages.
 
 ---
 
@@ -294,11 +301,11 @@ This is a classic **fixed-window** rate limiter (simple and works well enough fo
 ```
 Client (curl / Postman)
   |  POST /admin/routes
-  |  Header: X-Admin-Key: admin-secret
+  |  Header: Authorization: Bearer <token>
   |  Body:   { "path": "/orders/**", "serviceName": "order-service", ... }
   v
-[WebFilter]  AdminApiKeyWebFilter
-  - path starts with /admin/  → check X-Admin-Key
+[WebFilter]  AdminAuthWebFilter
+  - path starts with /admin/  → validate token, role and team
   - OK → continue
   v
 [Dispatcher] Spring routes to AdminRouteController.createRoute(...)
@@ -353,7 +360,8 @@ Client gets the JSON, plus X-RateLimit-* response headers.
 ## 13. How to Run It Locally
 
 ```bash
-# 1. Start Redis (needed for rate limiting)
+# 1. Set TRAFFICPILOT_DB_PASSWORD in this terminal first (see PostgreSQL setup below).
+# Start PostgreSQL and Redis.
 docker compose up -d
 
 # 2. Start the mock backend in a separate terminal
@@ -362,11 +370,13 @@ javac PaymentServiceMock.java
 java PaymentServiceMock          # listens on 9001
 
 # 3. Start the gateway
-./mvnw spring-boot:run           # listens on 8080
+./mvnw spring-boot:run -Dspring-boot.run.profiles=demo  # listens on 8080
 
 # 4. Try it out
+# set TRAFFICPILOT_ADMIN_PASSWORD (min 10 chars) before step 3, then log in
+$token = (Invoke-RestMethod -Method Post http://localhost:8080/auth/login -ContentType application/json -Body '{"username":"admin","password":"<your password>"}').token
 # admin: list seeded services
-curl -H "X-Admin-Key: admin-secret" http://localhost:8080/admin/services
+curl -H "Authorization: Bearer $token" http://localhost:8080/admin/services
 
 # proxied call (needs the user key because the route has authRequired=true)
 curl -H "X-Api-Key: user-secret" http://localhost:8080/payments/status
@@ -390,11 +400,11 @@ done
 | 3. Service registry APIs | ✅ | `AdminServiceController`, `RegisteredService`, `RegisteredServiceRepository` |
 | 4. Route management APIs | ✅ | `AdminRouteController`, `GatewayRoute`, `GatewayRouteRepository` |
 | 5. Dynamic gateway routing | ✅ | `DatabaseRouteDefinitionRepository` + `RefreshRoutesEvent` |
-| 6. Auth policy | ✅ (API-key, not JWT yet) | `AdminApiKeyWebFilter`, `GatewayApiKeyFilter`, `ApiKeyProperties` |
+| 6. Auth policy | ✅ (user bearer tokens + gateway API key) | `AdminAuthWebFilter`, `GatewayApiKeyFilter`, `ApiKeyProperties` |
 | 7. Redis rate limiting | ✅ | `RedisRateLimitFilter` |
 | 8. Canary / weighted routing | ✅ | `CanaryRoutingFilter`, `AdminCanaryController`, `CanaryTarget`, `CanaryTargetRepository` |
 | 9. Config versioning + rollback | ❌ | not built yet |
-| 10. Scheduled health checks + audit logs | ❌ | (empty `service/` package is reserved for this) |
+| 10. Scheduled health checks + audit logs | ✅ | `ServiceHealthPoller`, `AuditService`, `AdminAuditController` |
 
 ---
 
@@ -405,14 +415,14 @@ If you want to internalize the codebase, read the files in this order:
 1. `pom.xml` — see the ingredients.
 2. `application.properties` — see the config knobs.
 3. `TrafficpilotApplication.java` — the 10-line entrypoint.
-4. `schema.sql` + `data.sql` — see the data.
+4. `schema.sql` + `data-demo.sql` — see the schema and optional demo data.
 5. `model/*.java` — DB entities.
 6. `repository/*.java` — how you talk to the DB (magic method names!).
 7. `dto/*.java` — API contract.
 8. `controller/AdminServiceController.java` — simplest CRUD, learn the reactive style here.
 9. `controller/AdminRouteController.java` — same idea + the `RefreshRoutesEvent` trick.
 10. `gateway/DatabaseRouteDefinitionRepository.java` — the bridge to Spring Cloud Gateway.
-11. `security/AdminApiKeyWebFilter.java` — simplest filter (WebFilter).
+11. `security/AdminAuthWebFilter.java` — authentication and role filter (WebFilter).
 12. `security/GatewayApiKeyFilter.java` — gateway-level filter (GlobalFilter).
 13. `ratelimit/RedisRateLimitFilter.java` — hardest file; teaches you Reactor + Redis.
 
@@ -461,7 +471,10 @@ Mapped by `model/CanaryTarget.java`.
 
 ### How the Filter Works — `CanaryRoutingFilter`
 
-Runs at order `1` (after auth=-1 and rate-limit=0, before Netty actually forwards the request).
+Runs at `RouteToRequestUrlFilter.ROUTE_TO_URL_FILTER_ORDER + 1` (10001).
+This is after API-key auth (-1), rate limiting (0), `StripPrefix`, and Gateway's
+normal request-URL construction (10000), but before Netty forwards the request.
+Running earlier would let Gateway overwrite the canary destination.
 
 ```
 1. Get matched route string-id from the exchange
@@ -469,18 +482,28 @@ Runs at order `1` (after auth=-1 and rate-limit=0, before Netty actually forward
 3. Load all enabled canary_targets for that route
 4. IF canary targets exist:
      Pick one using weighted random selection
-     Rewrite GATEWAY_REQUEST_URL_ATTR to the chosen service's base_url
+     Replace scheme/host/port in GATEWAY_REQUEST_URL_ATTR with the chosen backend
+     Preserve the already stripped path and raw query without double encoding
      Add X-Canary-Service response header (which backend was chosen)
 5. IF no canary targets: pass through normally (regular route still applies)
 ```
 
-**Weighted random algorithm** (in `weightedRandom()`):
-- Sum all weights.
-- Pick a random integer in `[0, totalWeight)`.
+**Weighted random algorithm** (in `weightedTarget()`):
+- Require positive enabled weights summing to 100.
+- Pick a random integer in `[0, 100)`.
 - Walk the list, accumulating weights, until the running total exceeds the random number.
 - That target wins.
 
-This works even when weights don't sum to exactly 100 (graceful degradation).
+Invalid weights or a missing/invalid registered service produce an explicit
+`503`, rather than silently selecting the first target. Requests without canary
+targets follow the normal route exactly once. As with normal Gateway routes,
+backend base-URL paths do not prefix the forwarded path; use route path filters.
+
+Canary replacement validates all targets before writing, rejects duplicates, and
+requires every target to belong to the route's owning team (even for platform
+admins). Delete-and-insert plus its audit entry run in one reactive PostgreSQL
+transaction, so failed writes preserve the old split. Route changes and canary
+removal are transactional too. Refresh events are published after commit.
 
 ### Admin API — `AdminCanaryController` → `/admin/routes/{routeId}/canary`
 
@@ -490,7 +513,7 @@ This works even when weights don't sum to exactly 100 (graceful degradation).
 | PUT | `/admin/routes/{id}/canary` | Set (replace) canary targets — weights must sum to 100 |
 | DELETE | `/admin/routes/{id}/canary` | Remove all canary targets (revert to normal routing) |
 
-All protected by `X-Admin-Key`.
+All require a bearer token and are scoped to the caller's team (write needs `TEAM_ADMIN` or `PLATFORM_ADMIN`).
 
 ### Demo Walkthrough
 
@@ -499,17 +522,17 @@ All protected by `X-Admin-Key`.
 cd mock-services/payment-service && java PaymentServiceMock    # port 9001
 cd mock-services/payment-service-v2 && javac PaymentServiceV2Mock.java && java PaymentServiceV2Mock  # port 9002
 
-# 2. Start the gateway (Redis must be up)
+# 2. Start the gateway (set TRAFFICPILOT_DB_PASSWORD first; PostgreSQL and Redis must be up)
 docker compose up -d
-./mvnw spring-boot:run
+./mvnw spring-boot:run -Dspring-boot.run.profiles=demo
 
 # 3. Find the route ID (numeric PK from gateway_routes table)
-curl -H "X-Admin-Key: admin-secret" http://localhost:8080/admin/routes
+curl -H "Authorization: Bearer $token" http://localhost:8080/admin/routes
 # Note the "id" field (e.g. 1) in the response
 
 # 4. Set 90/10 canary split on route id=1
 curl -X PUT http://localhost:8080/admin/routes/1/canary \
-  -H "X-Admin-Key: admin-secret" \
+  -H "Authorization: Bearer $token" \
   -H "Content-Type: application/json" \
   -d '{
     "targets": [
@@ -525,7 +548,7 @@ done
 
 # 6. Remove canary → all traffic back to v1
 curl -X DELETE http://localhost:8080/admin/routes/1/canary \
-  -H "X-Admin-Key: admin-secret"
+  -H "Authorization: Bearer $token"
 ```
 
 ---
@@ -534,12 +557,128 @@ curl -X DELETE http://localhost:8080/admin/routes/1/canary \
 
 TrafficPilot is a Spring Boot app that:
 
-1. **Stores** a list of backend services and routing rules in an H2 database.
-2. **Exposes admin APIs** (`/admin/services`, `/admin/routes`) protected by an admin API key, so operators can create/list/delete services and routes.
+1. **Stores** a list of backend services and routing rules in a persistent PostgreSQL database.
+2. **Exposes admin APIs** (`/admin/services`, `/admin/routes`) protected by user login with team-scoped roles, so operators can create/list/delete services and routes.
 3. **Feeds those DB rows to Spring Cloud Gateway** through a custom `RouteDefinitionRepository`, and refreshes the gateway live whenever routes change.
 4. **Intercepts every proxied request** with two global filters:
    - a per-route API-key check, and
    - a Redis-backed fixed-window rate limiter.
 5. **Proxies** matching requests to the real backend (currently a tiny `PaymentServiceMock` on port 9001).
 
-Next planned phases are canary weighted routing, config versioning/rollback, scheduled health checks, and an audit log.
+Weighted canary routing, health polling and route-change auditing are implemented.
+Config versioning/rollback remains a future phase; self-signup, SSO and additional
+role types are not included.
+
+---
+
+## 19. Admin Frontend
+
+The admin console is served by Spring Boot from `src/main/resources/static/`; open the app's base URL (for example, `http://localhost:8080/`) to use it. It calls the existing admin APIs to list, register, and delete services; list, create, and delete routes; and configure or remove canary traffic splits. The overview also reads `/actuator/health`.
+
+The console shows a sign-in dialog. After login it keeps the bearer token in the current tab's `sessionStorage` and sends it as `Authorization: Bearer`; a `401` returns you to the login dialog. The UI adapts to the role: viewers see no add/delete buttons, and only platform admins see the "Teams & users" panels for creating teams and users. Team admins and viewers only see their own team's data.
+
+The audit panel shows route/canary changes with actor, timestamp and details
+(50 entries per page, Newer/Older navigation). Service health and last-checked
+timestamps refresh every 30 seconds in visible, signed-in tabs without resetting
+the canary editor. Use Refresh to reload full configuration.
+
+---
+
+## 20. PostgreSQL Setup and Persistence
+
+Requires Java 21, Docker Desktop running with Linux containers, and an available local port 5432.
+In PowerShell, from the project root:
+
+```powershell
+# Enter a local database password without writing it into this repository.
+$credential = Get-Credential -UserName trafficpilot -Message "Choose a local PostgreSQL password"
+$env:TRAFFICPILOT_DB_PASSWORD = $credential.GetNetworkCredential().Password
+# On first startup, choose the admin login password (at least 10 characters).
+$adminCredential = Get-Credential -UserName admin -Message "Choose the first admin password"
+$env:TRAFFICPILOT_ADMIN_PASSWORD = $adminCredential.GetNetworkCredential().Password
+docker compose up -d --wait
+.\mvnw.cmd spring-boot:run
+```
+
+Run Maven in the same terminal so it inherits the password. A fresh database starts with no registered services or routes. For optional mock data instead, use:
+
+```powershell
+.\mvnw.cmd spring-boot:run "-Dspring-boot.run.profiles=demo"
+```
+
+Database settings:
+
+| Environment variable | Default / purpose |
+|---|---|
+| `TRAFFICPILOT_DB_PASSWORD` | Required by both Compose and Spring Boot |
+| `TRAFFICPILOT_DB_USERNAME` | `trafficpilot` |
+| `TRAFFICPILOT_DB_URL` | `r2dbc:postgresql://localhost:5432/trafficpilot` (application connection) |
+| `TRAFFICPILOT_DB_PORT` | `5432` (Compose host port; if changed, set the application URL to the same port) |
+
+PostgreSQL data lives in the Compose `postgres-data` named volume. Ordinary app restarts, container restarts, and `docker compose down` followed by `up` preserve it. Do not use `docker compose down -v`: that deletes the database volume. Keep database backups for important configuration. PostgreSQL initialization credentials apply only when the volume is first created; changing environment variables alone does not change an existing database user's password.
+
+The old H2 database was in memory; its data is not automatically migrated. Export any configuration needed from the still-running old application's admin APIs before shutting it down, then recreate it against PostgreSQL.
+
+Run `.\mvnw.cmd clean test` against a **dedicated test PostgreSQL database and Redis**,
+with `TRAFFICPILOT_DB_URL`, `TRAFFICPILOT_DB_USERNAME`, `TRAFFICPILOT_DB_PASSWORD` and
+`SPRING_DATA_REDIS_PORT` set appropriately. Tests initialize the schema and create a
+test bootstrap admin; integration fixtures use unique names and clean up their own
+rows and Redis keys. Do not point tests at a production database. `clean` removes
+stale compiled resources from the previous H2 setup. SQL initialization creates
+missing schema objects and applies the explicit `ADD COLUMN IF NOT EXISTS`
+statements; use versioned migrations before evolving a deployed database.
+
+## 21. Route Audit History
+
+`audit_entries` stores immutable snapshots of the actor ID/username, owning team,
+numeric route ID, route name, action, details and UTC timestamp. Supported actions:
+`ROUTE_CREATED`, `ROUTE_DELETED`, `CANARY_REPLACED`, `CANARY_REMOVED`.
+Only successful changes are recorded, in the same transaction as the change.
+Audit failure rolls back the configuration change. Audit records deliberately
+have no foreign keys to routes or users, so deleting either does not erase history.
+There is no audit edit/delete API.
+
+`GET /admin/audit?limit=50&offset=0` requires a bearer token. Platform admins can
+read all teams; team admins and viewers can read only their own team's history,
+including deleted routes. `limit` is 1-100; `offset` must be non-negative. History
+is newest-first by monotonically increasing ID. This is application-level
+auditing, not a tamper-proof compliance store; DB admins can still modify it.
+Service/user management and failed requests are not audited.
+
+## 22. Scheduled Backend Health Checks
+
+`ServiceHealthPoller` starts after 5 seconds and polls registered backends every
+30 seconds (fixed delay after completion). Up to four checks run concurrently,
+with a two-second total timeout per check. Spring subscribes to the reactive
+scheduled method; each subscription re-reads current services.
+The WebClient starter provides Boot's configured HTTP client builder.
+
+The poller requests the configured `healthCheckPath` on the backend's HTTP(S)
+origin (for example `http://localhost:9001/health`). Paths must begin with a single
+`/` and cannot contain a query or fragment; they cannot redirect checks to another
+host. HTTP 2xx means `UP`; other status codes, connection failures, invalid legacy
+URLs and timeouts mean `DOWN`. Response bodies are released. Results update only
+`status` and `last_checked_at`, without overwriting service configuration.
+Errors are logged; the next poll can recover a backend to `UP`.
+
+These are **observational checks**, not circuit breaking, failover or automatic
+route disablement. A DOWN backend may still receive traffic. Gateway
+`/actuator/health` remains a separate check of TrafficPilot and its infrastructure.
+
+| Property | Default |
+|---|---|
+| `trafficpilot.health.enabled` | `true` (set `false` to disable polling) |
+| `trafficpilot.health.interval` | `30s` |
+| `trafficpilot.health.initial-delay` | `5s` |
+| `trafficpilot.health.timeout` | `2s` |
+
+Focused, infrastructure-free regression tests:
+
+```powershell
+.\mvnw.cmd "-Dtest=CanaryRoutingFilterTest,RedisRateLimitFilterTest,ServiceHealthPollerTest" test
+```
+
+The full suite also verifies real HTTP routing/stripping/query preservation,
+disabled routes, gateway auth, atomic Redis limits under concurrent traffic,
+expiry/TTL repair, PostgreSQL audit persistence/isolation/deletion retention,
+transaction rollback when auditing fails, and persisted backend health.

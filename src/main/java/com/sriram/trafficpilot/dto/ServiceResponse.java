@@ -11,6 +11,7 @@ public record ServiceResponse(
 		String healthCheckPath,
 		String ownerTeam,
 		String status,
+		Instant lastCheckedAt,
 		Instant createdAt
 ) {
 
@@ -22,6 +23,7 @@ public record ServiceResponse(
 				service.getHealthCheckPath(),
 				service.getOwnerTeam(),
 				service.getStatus(),
+				service.getLastCheckedAt(),
 				service.getCreatedAt()
 		);
 	}

@@ -14,8 +14,18 @@ public class RegisteredService {
 	private String baseUrl;
 	private String healthCheckPath;
 	private String ownerTeam;
+	private Long teamId;
 	private String status;
+	private Instant lastCheckedAt;
 	private Instant createdAt;
+
+	public Long getTeamId() {
+		return teamId;
+	}
+
+	public void setTeamId(Long teamId) {
+		this.teamId = teamId;
+	}
 
 	public Long getId() {
 		return id;
@@ -59,6 +69,14 @@ public class RegisteredService {
 
 	public String getStatus() {
 		return status;
+	}
+
+	public Instant getLastCheckedAt() {
+		return lastCheckedAt;
+	}
+
+	public void setLastCheckedAt(Instant lastCheckedAt) {
+		this.lastCheckedAt = lastCheckedAt;
 	}
 
 	public void setStatus(String status) {
